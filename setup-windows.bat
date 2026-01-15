@@ -12,7 +12,7 @@ if %errorlevel% neq 0 (
     echo Por favor, descarga e instala Node.js desde:
     echo https://nodejs.org/
     echo.
-    echo Despues de instalar, ejecuta este script de nuevo.
+    echo Despues de instalar, reinicia y ejecuta este script de nuevo.
     pause
     exit /b 1
 )
@@ -21,8 +21,31 @@ echo [OK] Node.js encontrado:
 node --version
 echo.
 
-:: Install dependencies
-echo Instalando dependencias...
+:: Check if ngrok is installed
+where ngrok >nul 2>nul
+if %errorlevel% neq 0 (
+    echo [!] ngrok no encontrado. Instalando...
+    echo.
+    winget install ngrok.ngrok --accept-source-agreements --accept-package-agreements
+    if %errorlevel% neq 0 (
+        echo [ERROR] No se pudo instalar ngrok
+        echo Instala manualmente desde: https://ngrok.com/download
+        pause
+        exit /b 1
+    )
+    echo.
+    echo [OK] ngrok instalado.
+    echo [!] IMPORTANTE: Cierra esta ventana y abre una nueva para continuar.
+    pause
+    exit /b 0
+)
+
+echo [OK] ngrok encontrado:
+ngrok version
+echo.
+
+:: Install npm dependencies
+echo Instalando dependencias de Node.js...
 call npm install
 if %errorlevel% neq 0 (
     echo [ERROR] Error instalando dependencias
@@ -32,27 +55,26 @@ if %errorlevel% neq 0 (
 echo [OK] Dependencias instaladas
 echo.
 
-:: List printers
+:: Check ngrok auth
 echo ============================================
-echo   Impresoras disponibles en el sistema:
-echo ============================================
-wmic printer get name
-echo.
-
-echo ============================================
-echo   Configuracion
+echo   Configuracion de ngrok
 echo ============================================
 echo.
-echo Edita el archivo .env y cambia PRINTER_INTERFACE
-echo con el nombre exacto de tu impresora termica.
+echo Necesitas configurar tu token de ngrok.
 echo.
-echo Ejemplo: PRINTER_INTERFACE=printer:POS-58
-echo.
-echo ============================================
-echo   Para iniciar el servidor:
-echo ============================================
-echo.
-echo   npm start
+echo 1. Ve a: https://dashboard.ngrok.com/get-started/your-authtoken
+echo 2. Copia tu authtoken
+echo 3. Ejecuta: ngrok config add-authtoken TU_TOKEN
 echo.
 echo ============================================
+echo   Siguiente paso
+echo ============================================
+echo.
+echo Despues de configurar el authtoken, ejecuta:
+echo.
+echo   start-all.bat     (para probar manualmente)
+echo   install-autostart.bat  (para inicio automatico)
+echo.
+echo URL fija: https://capital-bird-jolly.ngrok-free.app
+echo.
 pause
