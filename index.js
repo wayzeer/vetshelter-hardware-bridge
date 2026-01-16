@@ -1,7 +1,9 @@
 const express = require('express');
 const cors = require('cors');
-const escpos = require('escpos');
-escpos.USB = require('escpos-usb');
+const { exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 require('dotenv').config();
 
 const app = express();
@@ -10,36 +12,56 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'vetshelter-hardware-2024';
+const PRINTER_NAME = process.env.PRINTER_NAME || 'POSPrinter POS-80';
 
-// Find USB printer using detected vendorId/productId
-function findPrinter() {
-  try {
-    const devices = escpos.USB.findPrinter();
-    if (!devices || devices.length === 0) {
-      console.error('No USB printer detected');
-      return null;
-    }
-    // Use first detected printer's vendor/product IDs
-    const d = devices[0];
-    const vendorId = d.deviceDescriptor?.idVendor;
-    const productId = d.deviceDescriptor?.idProduct;
-    console.log(`Connecting to printer: vendorId=${vendorId}, productId=${productId}`);
-    const device = new escpos.USB(vendorId, productId);
-    return device;
-  } catch (error) {
-    console.error('No USB printer found:', error.message);
-    return null;
-  }
+// ESC/POS Commands
+const ESC = '\x1B';
+const GS = '\x1D';
+const Commands = {
+  INIT: ESC + '@',
+  ALIGN_LEFT: ESC + 'a' + '\x00',
+  ALIGN_CENTER: ESC + 'a' + '\x01',
+  ALIGN_RIGHT: ESC + 'a' + '\x02',
+  BOLD_ON: ESC + 'E' + '\x01',
+  BOLD_OFF: ESC + 'E' + '\x00',
+  DOUBLE_SIZE: GS + '!' + '\x11',
+  NORMAL_SIZE: GS + '!' + '\x00',
+  CUT: GS + 'V' + '\x00',
+  CASH_DRAWER: ESC + 'p' + '\x00' + '\x19' + '\xFA',
+  FEED: ESC + 'd' + '\x02',
+};
+
+// Print raw data to Windows printer
+function printRaw(data) {
+  return new Promise((resolve, reject) => {
+    const tempFile = path.join(os.tmpdir(), `receipt_${Date.now()}.bin`);
+
+    fs.writeFileSync(tempFile, data, 'binary');
+
+    // Use PowerShell to send raw data to printer
+    const cmd = `powershell -Command "Get-Content -Path '${tempFile}' -Encoding Byte -Raw | Out-Printer -Name '${PRINTER_NAME}'"`;
+
+    exec(cmd, (error, stdout, stderr) => {
+      // Clean up temp file
+      try { fs.unlinkSync(tempFile); } catch (e) {}
+
+      if (error) {
+        console.error('Print error:', stderr);
+        reject(new Error(stderr || error.message));
+      } else {
+        resolve();
+      }
+    });
+  });
 }
 
-// List all USB devices (for debugging)
-function listUSBDevices() {
-  try {
-    const devices = escpos.USB.findPrinter();
-    return devices || [];
-  } catch (error) {
-    return [];
-  }
+// Build ESC/POS text line
+function textLine(text) {
+  return text + '\n';
+}
+
+function drawLine(width = 32) {
+  return '-'.repeat(width) + '\n';
 }
 
 // Middleware to verify API key
@@ -53,55 +75,35 @@ function verifyApiKey(req, res, next) {
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  const devices = listUSBDevices();
   res.json({
     status: 'ok',
     service: 'vetshelter-hardware-bridge',
-    usbDevicesFound: devices.length,
-    printerReady: devices.length > 0
+    printerName: PRINTER_NAME,
+    printerReady: true
   });
 });
 
-// List USB printers
+// List printers
 app.get('/printers', verifyApiKey, (req, res) => {
-  try {
-    const devices = listUSBDevices();
+  exec('powershell -Command "Get-Printer | Select-Object -ExpandProperty Name"', (error, stdout) => {
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    const printers = stdout.trim().split('\n').filter(p => p.trim());
     res.json({
-      printers: devices.map((d, i) => ({
-        index: i,
-        vendorId: d.deviceDescriptor?.idVendor,
-        productId: d.deviceDescriptor?.idProduct
-      }))
+      printers: printers.map(name => ({ name: name.trim() })),
+      configured: PRINTER_NAME
     });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+  });
 });
 
 // Open cash drawer
 app.post('/drawer/open', verifyApiKey, async (req, res) => {
   try {
-    const device = findPrinter();
-    if (!device) {
-      return res.status(503).json({ success: false, error: 'No se encontró impresora USB' });
-    }
-
-    const printer = new escpos.Printer(device);
-
-    device.open((err) => {
-      if (err) {
-        return res.status(500).json({ success: false, error: err.message });
-      }
-
-      // ESC/POS command to open cash drawer
-      // Most drawers: ESC p 0 25 250 (pin 2) or ESC p 1 25 250 (pin 5)
-      printer
-        .cashdraw(2)  // Pin 2 (most common)
-        .close(() => {
-          console.log('Cash drawer opened');
-          res.json({ success: true, message: 'Cajón abierto' });
-        });
-    });
+    const data = Commands.INIT + Commands.CASH_DRAWER;
+    await printRaw(data);
+    console.log('Cash drawer opened');
+    res.json({ success: true, message: 'Cajón abierto' });
   } catch (error) {
     console.error('Error opening cash drawer:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -117,123 +119,97 @@ app.post('/print/receipt', verifyApiKey, async (req, res) => {
       return res.status(400).json({ error: 'Invoice data required' });
     }
 
-    const device = findPrinter();
-    if (!device) {
-      return res.status(503).json({ success: false, error: 'No se encontró impresora USB' });
+    let receipt = Commands.INIT;
+
+    // Header
+    receipt += Commands.ALIGN_CENTER;
+    receipt += Commands.BOLD_ON;
+    receipt += Commands.DOUBLE_SIZE;
+    receipt += textLine(clinic?.name || 'VetWonder');
+    receipt += Commands.NORMAL_SIZE;
+    receipt += Commands.BOLD_OFF;
+
+    if (clinic?.address) receipt += textLine(clinic.address);
+    if (clinic?.phone) receipt += textLine(`Tel: ${clinic.phone}`);
+    if (clinic?.cif) receipt += textLine(`CIF: ${clinic.cif}`);
+
+    receipt += drawLine();
+    receipt += Commands.ALIGN_LEFT;
+    receipt += Commands.BOLD_ON;
+    receipt += textLine(`FACTURA: ${invoice.number || invoice.id}`);
+    receipt += Commands.BOLD_OFF;
+    receipt += textLine(`Fecha: ${new Date(invoice.issueDate || invoice.createdAt).toLocaleDateString('es-ES')}`);
+
+    if (invoice.customer) {
+      receipt += textLine(`Cliente: ${invoice.customer.name}`);
+      if (invoice.customer.nif) {
+        receipt += textLine(`NIF: ${invoice.customer.nif}`);
+      }
     }
 
-    const printer = new escpos.Printer(device);
+    receipt += drawLine();
 
-    device.open((err) => {
-      if (err) {
-        return res.status(500).json({ success: false, error: err.message });
+    // Invoice lines
+    if (invoice.lines && invoice.lines.length > 0) {
+      for (const line of invoice.lines) {
+        const description = (line.description || line.concept || 'Item').substring(0, 32);
+        const qty = line.quantity || 1;
+        const price = parseFloat(line.unitPrice || line.price || 0);
+        const total = (qty * price).toFixed(2);
+        receipt += textLine(description);
+        receipt += textLine(`  ${qty} x ${price.toFixed(2)} = ${total} EUR`);
       }
+    }
 
-      // Build receipt
-      printer
-        .align('ct')
-        .style('b')
-        .size(1, 1)
-        .text(clinic?.name || 'VetShelter')
-        .style('normal')
-        .size(1, 1);
+    receipt += drawLine();
 
-      if (clinic?.address) {
-        printer.text(clinic.address);
+    // Totals
+    receipt += Commands.ALIGN_RIGHT;
+    if (invoice.subtotal) {
+      receipt += textLine(`Subtotal: ${parseFloat(invoice.subtotal).toFixed(2)} EUR`);
+    }
+    if (invoice.totalVat) {
+      receipt += textLine(`IVA: ${parseFloat(invoice.totalVat).toFixed(2)} EUR`);
+    }
+    if (invoice.discountAmount && parseFloat(invoice.discountAmount) > 0) {
+      receipt += textLine(`Descuento: -${parseFloat(invoice.discountAmount).toFixed(2)} EUR`);
+    }
+
+    receipt += Commands.BOLD_ON;
+    receipt += Commands.DOUBLE_SIZE;
+    receipt += textLine(`TOTAL: ${parseFloat(invoice.total).toFixed(2)} EUR`);
+    receipt += Commands.NORMAL_SIZE;
+    receipt += Commands.BOLD_OFF;
+
+    receipt += Commands.ALIGN_LEFT;
+    receipt += drawLine();
+
+    // Payment info
+    if (invoice.payments && invoice.payments.length > 0) {
+      receipt += textLine('PAGOS:');
+      for (const payment of invoice.payments) {
+        const method = payment.method || 'efectivo';
+        const amount = parseFloat(payment.amount).toFixed(2);
+        receipt += textLine(`  ${method}: ${amount} EUR`);
       }
-      if (clinic?.phone) {
-        printer.text(`Tel: ${clinic.phone}`);
-      }
-      if (clinic?.cif) {
-        printer.text(`CIF: ${clinic.cif}`);
-      }
+      receipt += drawLine();
+    }
 
-      printer
-        .drawLine()
-        .align('lt')
-        .style('b')
-        .text(`FACTURA: ${invoice.number || invoice.id}`)
-        .style('normal')
-        .text(`Fecha: ${new Date(invoice.issueDate || invoice.createdAt).toLocaleDateString('es-ES')}`);
+    // Footer
+    receipt += Commands.ALIGN_CENTER;
+    receipt += textLine('Gracias por su visita');
+    receipt += Commands.FEED;
 
-      if (invoice.customer) {
-        printer.text(`Cliente: ${invoice.customer.name}`);
-        if (invoice.customer.nif) {
-          printer.text(`NIF: ${invoice.customer.nif}`);
-        }
-      }
+    // Open cash drawer if requested
+    if (openDrawer) {
+      receipt += Commands.CASH_DRAWER;
+    }
 
-      printer.drawLine();
+    receipt += Commands.CUT;
 
-      // Invoice lines
-      if (invoice.lines && invoice.lines.length > 0) {
-        for (const line of invoice.lines) {
-          const description = (line.description || line.concept || 'Item').substring(0, 32);
-          const qty = line.quantity || 1;
-          const price = parseFloat(line.unitPrice || line.price || 0);
-          const total = (qty * price).toFixed(2);
-
-          printer
-            .text(description)
-            .text(`  ${qty} x ${price.toFixed(2)} = ${total} EUR`);
-        }
-      }
-
-      printer.drawLine();
-
-      // Totals
-      printer.align('rt');
-
-      if (invoice.subtotal) {
-        printer.text(`Subtotal: ${parseFloat(invoice.subtotal).toFixed(2)} EUR`);
-      }
-      if (invoice.totalVat) {
-        printer.text(`IVA: ${parseFloat(invoice.totalVat).toFixed(2)} EUR`);
-      }
-      if (invoice.discountAmount && parseFloat(invoice.discountAmount) > 0) {
-        printer.text(`Descuento: -${parseFloat(invoice.discountAmount).toFixed(2)} EUR`);
-      }
-
-      printer
-        .style('b')
-        .size(1, 1)
-        .text(`TOTAL: ${parseFloat(invoice.total).toFixed(2)} EUR`)
-        .style('normal')
-        .size(1, 1);
-
-      printer
-        .align('lt')
-        .drawLine();
-
-      // Payment info
-      if (invoice.payments && invoice.payments.length > 0) {
-        printer.text('PAGOS:');
-        for (const payment of invoice.payments) {
-          const method = payment.method || 'efectivo';
-          const amount = parseFloat(payment.amount).toFixed(2);
-          printer.text(`  ${method}: ${amount} EUR`);
-        }
-        printer.drawLine();
-      }
-
-      // Footer
-      printer
-        .align('ct')
-        .text('Gracias por su visita')
-        .feed(2);
-
-      // Open cash drawer if requested
-      if (openDrawer) {
-        printer.cashdraw(2);
-      }
-
-      printer
-        .cut()
-        .close(() => {
-          console.log('Receipt printed for invoice:', invoice.number || invoice.id);
-          res.json({ success: true, message: 'Ticket impreso' });
-        });
-    });
+    await printRaw(receipt);
+    console.log('Receipt printed for invoice:', invoice.number || invoice.id);
+    res.json({ success: true, message: 'Ticket impreso' });
   } catch (error) {
     console.error('Error printing receipt:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -243,39 +219,26 @@ app.post('/print/receipt', verifyApiKey, async (req, res) => {
 // Print test page
 app.post('/print/test', verifyApiKey, async (req, res) => {
   try {
-    const device = findPrinter();
-    if (!device) {
-      return res.status(503).json({ success: false, error: 'No se encontró impresora USB' });
-    }
+    let testPage = Commands.INIT;
+    testPage += Commands.ALIGN_CENTER;
+    testPage += Commands.BOLD_ON;
+    testPage += Commands.DOUBLE_SIZE;
+    testPage += textLine('VetWonder');
+    testPage += Commands.NORMAL_SIZE;
+    testPage += Commands.BOLD_OFF;
+    testPage += textLine('Hardware Bridge');
+    testPage += drawLine();
+    testPage += textLine('Test de impresion OK');
+    testPage += textLine(new Date().toLocaleString('es-ES'));
+    testPage += drawLine();
+    testPage += textLine('Impresora configurada');
+    testPage += textLine('correctamente');
+    testPage += Commands.FEED;
+    testPage += Commands.CUT;
 
-    const printer = new escpos.Printer(device);
-
-    device.open((err) => {
-      if (err) {
-        return res.status(500).json({ success: false, error: err.message });
-      }
-
-      printer
-        .align('ct')
-        .style('b')
-        .size(2, 2)
-        .text('VetShelter')
-        .size(1, 1)
-        .style('normal')
-        .text('Hardware Bridge')
-        .drawLine()
-        .text('Test de impresion OK')
-        .text(new Date().toLocaleString('es-ES'))
-        .drawLine()
-        .text('Impresora configurada')
-        .text('correctamente')
-        .feed(2)
-        .cut()
-        .close(() => {
-          console.log('Test page printed');
-          res.json({ success: true, message: 'Página de prueba impresa' });
-        });
-    });
+    await printRaw(testPage);
+    console.log('Test page printed');
+    res.json({ success: true, message: 'Pagina de prueba impresa' });
   } catch (error) {
     console.error('Error printing test:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -285,26 +248,19 @@ app.post('/print/test', verifyApiKey, async (req, res) => {
 // Start server
 app.listen(PORT, () => {
   console.log('============================================');
-  console.log('  VetShelter Hardware Bridge');
+  console.log('  VetWonder Hardware Bridge');
   console.log('============================================');
   console.log(`Servidor corriendo en puerto ${PORT}`);
   console.log(`API Key: ${API_KEY}`);
+  console.log(`Impresora: ${PRINTER_NAME}`);
   console.log('');
-
-  // Check for USB printers
-  const devices = listUSBDevices();
-  if (devices.length > 0) {
-    console.log(`[OK] Impresora USB encontrada (${devices.length} dispositivo(s))`);
-  } else {
-    console.log('[!] No se encontró impresora USB');
-    console.log('    Asegúrate de que la impresora está conectada y encendida');
-  }
+  console.log('Usando Windows Print Spooler');
   console.log('');
   console.log('Endpoints:');
   console.log('  GET  /health        - Estado del servidor');
-  console.log('  GET  /printers      - Lista impresoras USB');
-  console.log('  POST /drawer/open   - Abrir cajón');
+  console.log('  GET  /printers      - Lista impresoras Windows');
+  console.log('  POST /drawer/open   - Abrir cajon');
   console.log('  POST /print/receipt - Imprimir ticket');
-  console.log('  POST /print/test    - Página de prueba');
+  console.log('  POST /print/test    - Pagina de prueba');
   console.log('============================================');
 });
