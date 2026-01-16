@@ -18,5 +18,8 @@
     "escpos-usb": "^3.0.0-alpha.4",
     "express": "^5.2.1",
     "node-thermal-printer": "^4.5.0"
+  },
+  "overrides": {
+    "usb": "1.9.2"
   }
 }
