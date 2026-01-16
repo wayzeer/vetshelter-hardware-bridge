@@ -11,10 +11,20 @@ app.use(express.json());
 const PORT = process.env.PORT || 3456;
 const API_KEY = process.env.API_KEY || 'vetshelter-hardware-2024';
 
-// Find USB printer
+// Find USB printer using detected vendorId/productId
 function findPrinter() {
   try {
-    const device = new escpos.USB();
+    const devices = escpos.USB.findPrinter();
+    if (!devices || devices.length === 0) {
+      console.error('No USB printer detected');
+      return null;
+    }
+    // Use first detected printer's vendor/product IDs
+    const d = devices[0];
+    const vendorId = d.deviceDescriptor?.idVendor;
+    const productId = d.deviceDescriptor?.idProduct;
+    console.log(`Connecting to printer: vendorId=${vendorId}, productId=${productId}`);
+    const device = new escpos.USB(vendorId, productId);
     return device;
   } catch (error) {
     console.error('No USB printer found:', error.message);
