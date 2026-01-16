@@ -31,24 +31,27 @@ const Commands = {
   FEED: ESC + 'd' + '\x02',
 };
 
-// Print raw data to Windows printer
+// Print raw data to Windows printer using raw/binary mode
 function printRaw(data) {
   return new Promise((resolve, reject) => {
     const tempFile = path.join(os.tmpdir(), `receipt_${Date.now()}.bin`);
+    const scriptPath = path.join(__dirname, 'print-raw.ps1');
 
+    // Write binary data
     fs.writeFileSync(tempFile, data, 'binary');
 
-    // Use PowerShell to send raw data to printer
-    const cmd = `powershell -Command "Get-Content -Path '${tempFile}' -Encoding Byte -Raw | Out-Printer -Name '${PRINTER_NAME}'"`;
+    // Use PowerShell script to send raw data to printer
+    const cmd = `powershell -ExecutionPolicy Bypass -File "${scriptPath}" -PrinterName "${PRINTER_NAME}" -FilePath "${tempFile}"`;
 
     exec(cmd, (error, stdout, stderr) => {
       // Clean up temp file
       try { fs.unlinkSync(tempFile); } catch (e) {}
 
       if (error) {
-        console.error('Print error:', stderr);
+        console.error('Print error:', stderr || stdout);
         reject(new Error(stderr || error.message));
       } else {
+        console.log('Print output:', stdout);
         resolve();
       }
     });
